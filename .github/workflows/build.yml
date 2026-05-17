@@ -37,6 +37,14 @@ jobs:
           fi
           chmod +x gradlew
 
+      - name: Buat gradle.properties
+        run: |
+          cat > android/gradle.properties << 'EOF'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
       - name: Build Debug APK
         run: |
           cd android
