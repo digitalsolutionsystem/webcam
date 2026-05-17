@@ -45,6 +45,28 @@ jobs:
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
+      - name: Generate placeholder icon app
+        run: |
+          RES=android/app/src/main/res
+          declare -A SIZES=(
+            [mipmap-mdpi]=48
+            [mipmap-hdpi]=72
+            [mipmap-xhdpi]=96
+            [mipmap-xxhdpi]=144
+            [mipmap-xxxhdpi]=192
+          )
+          for DIR in "${!SIZES[@]}"; do
+            SIZE=${SIZES[$DIR]}
+            mkdir -p "$RES/$DIR"
+            convert -size ${SIZE}x${SIZE} xc:#2196F3 \
+              -fill white -gravity center \
+              -pointsize $((SIZE/3)) -annotate 0 "DC" \
+              "$RES/$DIR/ic_launcher.png"
+            cp "$RES/$DIR/ic_launcher.png" "$RES/$DIR/ic_launcher_round.png"
+          done
+          echo "Icons generated:"
+          find $RES -name "ic_launcher*.png" | sort
+
       - name: Build Debug APK
         run: |
           cd android
