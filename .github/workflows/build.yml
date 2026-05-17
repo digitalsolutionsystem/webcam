@@ -45,34 +45,35 @@ jobs:
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
-      - name: Generate placeholder icon app
+      - name: Generate placeholder icon
         run: |
-          RES=android/app/src/main/res
-          declare -A SIZES=(
-            [mipmap-mdpi]=48
-            [mipmap-hdpi]=72
-            [mipmap-xhdpi]=96
-            [mipmap-xxhdpi]=144
-            [mipmap-xxxhdpi]=192
-          )
-          for DIR in "${!SIZES[@]}"; do
-            SIZE=${SIZES[$DIR]}
-            mkdir -p "$RES/$DIR"
-            convert -size ${SIZE}x${SIZE} xc:#2196F3 \
-              -fill white -gravity center \
-              -pointsize $((SIZE/3)) -annotate 0 "DC" \
-              "$RES/$DIR/ic_launcher.png"
-            cp "$RES/$DIR/ic_launcher.png" "$RES/$DIR/ic_launcher_round.png"
-          done
-          echo "Icons generated:"
-          find $RES -name "ic_launcher*.png" | sort
+          python3 << 'PYEOF'
+          import os, struct, zlib
+          def make_png(size):
+              def chunk(name, data):
+                  c = struct.pack('>I', len(data)) + name + data
+                  return c + struct.pack('>I', zlib.crc32(name + data) & 0xFFFFFFFF)
+              sig = b'\x89PNG\r\n\x1a\n'
+              ihdr = chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0))
+              raw = b''.join(b'\x00' + bytes([33,150,243]) * size for _ in range(size))
+              idat = chunk(b'IDAT', zlib.compress(raw))
+              return sig + ihdr + idat + chunk(b'IEND', b'')
+          base = 'android/app/src/main/res'
+          for d, s in [('mipmap-mdpi',48),('mipmap-hdpi',72),('mipmap-xhdpi',96),('mipmap-xxhdpi',144),('mipmap-xxxhdpi',192)]:
+              p = os.path.join(base, d)
+              os.makedirs(p, exist_ok=True)
+              png = make_png(s)
+              for n in ['ic_launcher.png','ic_launcher_round.png']:
+                  open(os.path.join(p,n),'wb').write(png)
+          print("Icons created")
+          PYEOF
 
       - name: Build Debug APK
         run: |
           cd android
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon
 
-      - name: Upload APK ke Artifacts
+      - name: Upload APK
         uses: actions/upload-artifact@v4.6.2
         with:
           name: DroidCamPro-debug

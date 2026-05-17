@@ -3,189 +3,229 @@ package com.example.webcam
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.net.wifi.WifiManager
+import android.graphics.ImageFormat
+import android.hardware.camera2.*
+import android.media.ImageReader
 import android.os.Bundle
-import android.text.format.Formatter
+import android.os.Handler
+import android.os.HandlerThread
+import android.view.Surface
 import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.pedro.encoder.input.video.CameraOpenException
-import com.pedro.rtsp.utils.ConstructorParameters
-import com.pedro.rtsp.rtsp.RtspClient
-import com.pedro.rtspserver.RtspServerCamera2
-import com.pedro.encoder.input.video.CameraHelper
-import java.util.*
+import java.net.NetworkInterface
 
-class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, ConnectCheckerRtsp {
+class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
-    private lateinit var rtspServerCamera2: RtspServerCamera2
     private lateinit var surfaceView: SurfaceView
     private lateinit var bStartStop: Button
     private lateinit var bSwitchCamera: Button
     private lateinit var tvUrl: TextView
     private lateinit var tvStatus: TextView
     private lateinit var spResolution: Spinner
-    
-    private val port = 8554
-    private val endpoint = "live"
-    
-    private val permissions = arrayOf(
-        Manifest.permission.CAMERA,
-        Manifest.permission.RECORD_AUDIO
-    )
+
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var imageReader: ImageReader? = null
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+    private var mjpegServer: MjpegServer? = null
+    private var isStreaming = false
+    private var currentCameraIndex = 0
+
+    private val port = 8080
+
+    private val permissions = arrayOf(Manifest.permission.CAMERA)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        
-        surfaceView = findViewById(R.id.surfaceView)
-        bStartStop = findViewById(R.id.b_start_stop)
-        bSwitchCamera = findViewById(R.id.b_switch_camera)
-        tvUrl = findViewById(R.id.tv_url)
-        tvStatus = findViewById(R.id.tv_status)
+
+        surfaceView  = findViewById(R.id.surfaceView)
+        bStartStop   = findViewById(R.id.b_start_stop)
+        bSwitchCamera= findViewById(R.id.b_switch_camera)
+        tvUrl        = findViewById(R.id.tv_url)
+        tvStatus     = findViewById(R.id.tv_status)
         spResolution = findViewById(R.id.sp_resolution)
 
-        rtspServerCamera2 = RtspServerCamera2(surfaceView, this, port)
         surfaceView.holder.addCallback(this)
+        setupResolutionSpinner()
+        updateUrlDisplay()
 
         bStartStop.setOnClickListener {
-            if (!rtspServerCamera2.isStreaming) {
-                if (checkPermissions()) {
-                    startStream()
-                } else {
-                    requestPermissions()
-                }
+            if (!isStreaming) {
+                if (checkPermissions()) startStream() else requestPerms()
             } else {
                 stopStream()
             }
         }
 
         bSwitchCamera.setOnClickListener {
-            try {
-                rtspServerCamera2.switchCamera()
-            } catch (e: CameraOpenException) {
-                Toast.makeText(this, e.message, Toast.LENGTH_SHORT).show()
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val count = manager.cameraIdList.size
+            if (count > 1) {
+                currentCameraIndex = (currentCameraIndex + 1) % count
+                if (isStreaming) { stopStream(); startStream() }
+            } else {
+                Toast.makeText(this, "Hanya ada 1 kamera", Toast.LENGTH_SHORT).show()
             }
         }
-
-        setupResolutionSpinner()
-        updateUrlDisplay()
     }
 
     private fun setupResolutionSpinner() {
-        val resolutions = arrayOf("720p (1280x720)", "1080p (1920x1080)", "480p (640x480)")
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, resolutions)
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        spResolution.adapter = adapter
-    }
-
-    private fun startStream() {
-        val resolution = spResolution.selectedItem.toString()
-        val width = if (resolution.contains("1080p")) 1920 else if (resolution.contains("720p")) 1280 else 640
-        val height = if (resolution.contains("1080p")) 1080 else if (resolution.contains("720p")) 720 else 480
-
-        tvStatus.text = "Status: Connecting..."
-        tvStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_blue_light))
-
-        if (rtspServerCamera2.prepareVideo(width, height, 30, 4000 * 1024, CameraHelper.getCameraOrientation(this))) {
-            rtspServerCamera2.prepareAudio()
-            rtspServerCamera2.startStream(endpoint)
-            bStartStop.text = "STOP STREAM"
-        } else {
-            Toast.makeText(this, "Error preparing stream", Toast.LENGTH_SHORT).show()
-            tvStatus.text = "Status: Error"
-            tvStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_red_dark))
+        val resolutions = arrayOf("720p (1280x720)", "480p (640x480)", "1080p (1920x1080)")
+        spResolution.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, resolutions).also {
+            it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         }
     }
 
+    private fun startBackgroundThread() {
+        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
+        backgroundHandler = Handler(backgroundThread!!.looper)
+    }
+
+    private fun stopBackgroundThread() {
+        backgroundThread?.quitSafely()
+        try { backgroundThread?.join() } catch (e: InterruptedException) { e.printStackTrace() }
+        backgroundThread = null
+        backgroundHandler = null
+    }
+
+    private fun startStream() {
+        startBackgroundThread()
+
+        val res = spResolution.selectedItem.toString()
+        val width  = when { res.contains("1080p") -> 1920; res.contains("720p") -> 1280; else -> 640 }
+        val height = when { res.contains("1080p") -> 1080; res.contains("720p") -> 720;  else -> 480 }
+
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val cameraIds = manager.cameraIdList
+        if (cameraIds.isEmpty()) {
+            showStatus("Tidak ada kamera", android.R.color.holo_red_dark)
+            return
+        }
+        val cameraId = cameraIds[minOf(currentCameraIndex, cameraIds.size - 1)]
+
+        // Setup ImageReader untuk ambil frame JPEG
+        imageReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 2)
+        imageReader!!.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                val buffer = image.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                mjpegServer?.pushFrame(bytes)
+            } finally {
+                image.close()
+            }
+        }, backgroundHandler)
+
+        // Start MJPEG server
+        mjpegServer = MjpegServer(port)
+        mjpegServer!!.start()
+
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED) return
+
+        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+            override fun onOpened(camera: CameraDevice) {
+                cameraDevice = camera
+
+                val surfaces = mutableListOf<Surface>(imageReader!!.surface)
+                val previewSurface = surfaceView.holder.surface
+                if (previewSurface != null) surfaces.add(previewSurface)
+
+                camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        captureSession = session
+                        val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            surfaces.forEach { addTarget(it) }
+                        }.build()
+                        session.setRepeatingRequest(request, null, backgroundHandler)
+                        isStreaming = true
+                        runOnUiThread {
+                            bStartStop.text = "STOP STREAM"
+                            showStatus("Streaming aktif ✓", android.R.color.holo_green_dark)
+                            updateUrlDisplay()
+                        }
+                    }
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        runOnUiThread { showStatus("Gagal konfigurasi kamera", android.R.color.holo_red_dark) }
+                    }
+                }, backgroundHandler)
+            }
+            override fun onDisconnected(camera: CameraDevice) { camera.close() }
+            override fun onError(camera: CameraDevice, error: Int) {
+                camera.close()
+                runOnUiThread { showStatus("Error kamera: $error", android.R.color.holo_red_dark) }
+            }
+        }, backgroundHandler)
+    }
+
     private fun stopStream() {
-        rtspServerCamera2.stopStream()
-        bStartStop.text = "START STREAM"
-        tvStatus.text = "Status: Idle"
-        tvStatus.setTextColor(ContextCompat.getColor(this, android.R.color.darker_gray))
+        captureSession?.close(); captureSession = null
+        cameraDevice?.close();   cameraDevice = null
+        imageReader?.close();    imageReader = null
+        mjpegServer?.stop();     mjpegServer = null
+        stopBackgroundThread()
+        isStreaming = false
+        runOnUiThread {
+            bStartStop.text = "START STREAM"
+            showStatus("Idle", android.R.color.darker_gray)
+        }
+    }
+
+    private fun showStatus(msg: String, colorRes: Int) {
+        tvStatus.text = "Status: $msg"
+        tvStatus.setTextColor(ContextCompat.getColor(this, colorRes))
     }
 
     private fun updateUrlDisplay() {
-        val ip = getIpAddress()
-        tvUrl.text = "rtsp://$ip:$port/$endpoint"
+        tvUrl.text = "http://${getIpAddress()}:$port/"
     }
 
     private fun getIpAddress(): String {
         try {
-            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            val interfaces = NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
                 val iface = interfaces.nextElement()
-                // Prioritize rndis0 (USB Tethering) and eth0
-                if (iface.name.contains("rndis") || iface.name.contains("eth") || iface.name.contains("wlan")) {
-                    val addresses = iface.inetAddresses
-                    while (addresses.hasMoreElements()) {
-                        val addr = addresses.nextElement()
-                        if (!addr.isLoopbackAddress && addr is java.net.InetAddress && addr.hostAddress.contains(".")) {
+                if (iface.name.startsWith("rndis") || iface.name.startsWith("eth") || iface.name.startsWith("wlan")) {
+                    val addrs = iface.inetAddresses
+                    while (addrs.hasMoreElements()) {
+                        val addr = addrs.nextElement()
+                        if (!addr.isLoopbackAddress && addr.hostAddress.contains('.'))
                             return addr.hostAddress
-                        }
                     }
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
         return "0.0.0.0"
     }
 
-    private fun checkPermissions(): Boolean {
-        return permissions.all {
-            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-        }
+    private fun checkPermissions() = permissions.all {
+        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
     }
 
-    private fun requestPermissions() {
-        ActivityCompat.requestPermissions(this, permissions, 1)
+    private fun requestPerms() = ActivityCompat.requestPermissions(this, permissions, 1)
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1 && grantResults.all { it == PackageManager.PERMISSION_GRANTED })
+            startStream()
+        else
+            Toast.makeText(this, "Izin kamera diperlukan", Toast.LENGTH_SHORT).show()
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        // Nothing to do here
-    }
+    override fun surfaceCreated(holder: SurfaceHolder) {}
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+    override fun surfaceDestroyed(holder: SurfaceHolder) { if (isStreaming) stopStream() }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        rtspServerCamera2.startPreview()
+    override fun onDestroy() {
+        super.onDestroy()
+        if (isStreaming) stopStream()
     }
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        if (rtspServerCamera2.isStreaming) {
-            rtspServerCamera2.stopStream()
-        }
-        rtspServerCamera2.stopPreview()
-    }
-
-    // ConnectCheckerRtsp implementation
-    override fun onConnectionSuccessRtsp() {
-        runOnUiThread { 
-            Toast.makeText(this, "Connection Success", Toast.LENGTH_SHORT).show() 
-            tvStatus.text = "Status: Streaming"
-            tvStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_green_dark))
-        }
-    }
-
-    override fun onConnectionFailedRtsp(reason: String) {
-        runOnUiThread {
-            Toast.makeText(this, "Connection Failed: $reason", Toast.LENGTH_SHORT).show()
-            tvStatus.text = "Status: Connection Error"
-            tvStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_red_dark))
-            stopStream()
-        }
-    }
-
-    override fun onNewBitrateRtsp(bitrate: Long) {}
-    override fun onDisconnectRtsp() {
-        runOnUiThread { 
-            Toast.makeText(this, "Disconnected", Toast.LENGTH_SHORT).show() 
-            tvStatus.text = "Status: Disconnected"
-            tvStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_orange_dark))
-        }
-    }
-    override fun onAuthErrorRtsp() {}
-    override fun onAuthSuccessRtsp() {}
 }
