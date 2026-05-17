@@ -1,0 +1,6 @@
+{
+  "name": "DroidCam Pro Custom",
+  "description": "Low-latency Android to Linux (OBS) webcam streaming system using Camera2 and H.264 MediaCodec.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
